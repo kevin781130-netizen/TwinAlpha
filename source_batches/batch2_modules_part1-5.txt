@@ -1,0 +1,2632 @@
+好，批次 2。把下面整段替换掉 `invest-os.html` 裡的 `<section id="batch2">...</section>`（那個 placeholder 整段刪掉）。
+
+内容较长，代码保持完整，说明精简。
+
+---
+
+```html
+<section id="batch2">
+<script type="text/plain" data-title="MODULES Part 1-5">
+# 模組完整程式碼 — Part 1-5
+
+本批次收錄：核心層、數據層、回測層、風控層、因子層，共 22 個模組。
+
+---
+
+# Part 1：核心層
+
+## 1.1 `app/config.py`
+
+**職責**：集中管理環境變數與預設參數。
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "TW/US Invest OS"
+
+    finmind_token: str | None = None
+
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_api_key: str | None = None
+    llm_model: str = "gpt-4o-mini"
+
+    # 台股費用
+    default_tw_fee_rate: float = 0.001425
+    default_tw_fee_discount: float = 0.6
+    default_tw_min_fee: float = 20.0
+    default_tw_tax_rate_sell: float = 0.003
+
+    # 美股費用
+    default_us_sec_fee_rate: float = 0.0000278
+    default_us_finra_taf_per_share: float = 0.000166
+    default_us_commission: float = 0.0
+
+
+settings = Settings()
+```
+
+---
+
+## 1.2 `app/domain/models.py`
+
+**職責**：定義所有核心資料模型（Pydantic v2）。
+
+```python
+from datetime import datetime
+from enum import Enum
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class Market(str, Enum):
+    TW = "TW"
+    US = "US"
+
+
+class Side(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class Bar(BaseModel):
+    symbol: str
+    market: Market
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class NewsItem(BaseModel):
+    title: str
+    summary: str | None = None
+    url: str | None = None
+    published_at: datetime | None = None
+    source: str | None = None
+
+
+class AnalystReport(BaseModel):
+    role: str
+    symbol: str = ""
+    market: Market | None = None
+    summary: str = ""
+    score: float = 0.0
+    key_points: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+
+
+class DebateResult(BaseModel):
+    bull_case: str = ""
+    bear_case: str = ""
+    rounds: list[dict] = Field(default_factory=list)
+
+
+class RiskReview(BaseModel):
+    max_position_pct: float = 0.1
+    stop_loss_pct: float = 0.08
+    take_profit_pct: float = 0.2
+    approved: bool = False
+    notes: str = ""
+
+
+class FinalDecision(BaseModel):
+    symbol: str
+    market: Market
+    action: Literal["BUY", "HOLD", "SELL", "AVOID"] = "HOLD"
+    confidence: float = 0.0
+    target_position_pct: float = 0.0
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    thesis: str = ""
+    reports: list[AnalystReport] = Field(default_factory=list)
+    debate: DebateResult | None = None
+    risk: RiskReview | None = None
+```
+
+---
+
+## 1.3 `app/markets/base.py`
+
+**職責**：市場規則抽象基類。
+
+```python
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+
+from app.domain.models import Market, Side
+
+
+class MarketRules(ABC):
+    market: Market
+    settlement_days: int
+    price_limit_pct: float | None
+    lot_size: int = 1
+
+    @abstractmethod
+    def calc_fees(self, side: Side, price: float, qty: int) -> float:
+        ...
+
+    @abstractmethod
+    def price_limits(self, prev_close: float):
+        ...
+
+    def settlement_date(self, trade_date: datetime) -> datetime:
+        return trade_date + timedelta(days=self.settlement_days)
+
+    def round_lot(self, qty: int) -> int:
+        if qty <= 0:
+            return 0
+        if self.lot_size <= 1:
+            return int(qty)
+        return (int(qty) // self.lot_size) * self.lot_size
+
+    def can_execute(self, side: Side, price: float, prev_close: float | None) -> bool:
+        if self.price_limit_pct is None or prev_close is None or prev_close <= 0:
+            return True
+
+        upper, lower = self.price_limits(prev_close)
+
+        if side == Side.BUY and upper is not None and price > upper:
+            return False
+        if side == Side.SELL and lower is not None and price < lower:
+            return False
+        return True
+```
+
+**修復記錄**：第 3 輪加入 `qty <= 0` 邊界與 `prev_close <= 0` 檢查。
+
+---
+
+## 1.4 `app/markets/taiwan.py`
+
+**職責**：台股市場規則（T+2 / ±10% / tick 對齊）。
+
+```python
+from app.config import settings
+from app.domain.models import Market, Side
+from app.markets.base import MarketRules
+
+
+def _tick_size(price: float) -> float:
+    """台股升降單位。"""
+    if price < 10:
+        return 0.01
+    if price < 50:
+        return 0.05
+    if price < 100:
+        return 0.1
+    if price < 500:
+        return 0.5
+    if price < 1000:
+        return 1.0
+    return 5.0
+
+
+class TaiwanRules(MarketRules):
+    market = Market.TW
+    settlement_days = 2
+    price_limit_pct = 0.10
+    lot_size = 1
+
+    def calc_fees(self, side: Side, price: float, qty: int) -> float:
+        gross = price * qty
+        fee = gross * settings.default_tw_fee_rate * settings.default_tw_fee_discount
+        fee = max(fee, settings.default_tw_min_fee)
+        tax = gross * settings.default_tw_tax_rate_sell if side == Side.SELL else 0.0
+        return round(fee + tax, 2)
+
+    def price_limits(self, prev_close: float) -> tuple[float, float]:
+        raw_upper = prev_close * (1 + self.price_limit_pct)
+        raw_lower = prev_close * (1 - self.price_limit_pct)
+        upper = self._ceil_tick(raw_upper)
+        lower = self._floor_tick(raw_lower)
+        return upper, lower
+
+    @staticmethod
+    def _ceil_tick(price: float) -> float:
+        import math
+        tick = _tick_size(price)
+        return round(math.ceil(price / tick) * tick, 4)
+
+    @staticmethod
+    def _floor_tick(price: float) -> float:
+        import math
+        tick = _tick_size(price)
+        return round(math.floor(price / tick) * tick, 4)
+```
+
+**修復記錄**：第 3 輪改用 tick 對齊規則（原本用 `round(x, 2)`）。
+
+---
+
+## 1.5 `app/markets/us.py`
+
+**職責**：美股市場規則（T+1 / 無漲跌幅）。
+
+```python
+from app.config import settings
+from app.domain.models import Market, Side
+from app.markets.base import MarketRules
+
+
+class USRules(MarketRules):
+    market = Market.US
+    settlement_days = 1
+    price_limit_pct = None
+    lot_size = 1
+
+    def calc_fees(self, side: Side, price: float, qty: int) -> float:
+        commission = settings.default_us_commission
+        sec_fee = (
+            price * qty * settings.default_us_sec_fee_rate
+            if side == Side.SELL else 0.0
+        )
+        finra_taf = (
+            qty * settings.default_us_finra_taf_per_share
+            if side == Side.SELL else 0.0
+        )
+        finra_taf = min(finra_taf, 8.30)
+        return round(commission + sec_fee + finra_taf, 4)
+
+    def price_limits(self, prev_close: float):
+        return None, None
+```
+
+**修復記錄**：第 3 輪加入 FINRA TAF $8.30 上限。
+
+---
+
+## 1.6 `app/markets/registry.py`
+
+**職責**：市場規則查找。
+
+```python
+from app.domain.models import Market
+from app.markets.taiwan import TaiwanRules
+from app.markets.us import USRules
+
+RULES = {
+    Market.TW: TaiwanRules(),
+    Market.US: USRules(),
+}
+
+
+def get_rules(market: Market):
+    return RULES[market]
+```
+
+---
+
+# Part 2：數據層
+
+## 2.1 `app/data/base.py`
+
+**職責**：數據提供者抽象基類。
+
+```python
+from abc import ABC, abstractmethod
+
+import pandas as pd
+
+from app.domain.models import Market, NewsItem
+
+
+class DataProvider(ABC):
+    @abstractmethod
+    async def get_bars(
+        self,
+        symbol: str,
+        market: Market,
+        start: str,
+        end: str,
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+        ...
+
+    @abstractmethod
+    async def get_fundamentals(self, symbol: str, market: Market) -> dict:
+        ...
+
+    @abstractmethod
+    async def get_news(self, symbol: str, market: Market, limit: int = 20) -> list[NewsItem]:
+        ...
+```
+
+---
+
+## 2.2 `app/data/warehouse.py`
+
+**職責**：DuckDB + Parquet 本地數據倉庫。
+
+```python
+import os
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+from app.domain.models import Market
+
+DATA_ROOT = Path(os.getenv("DATA_ROOT", "./data_lake"))
+PARQUET_DIR = DATA_ROOT / "parquet"
+DB_PATH = DATA_ROOT / "market.duckdb"
+
+
+def _market_str(market) -> str:
+    if isinstance(market, Market):
+        return market.value
+    return str(market)
+
+
+class MarketWarehouse:
+    def __init__(self, db_path: str | Path = DB_PATH):
+        self.db_path = str(db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+        self._ensure_tables()
+
+    def _conn(self) -> duckdb.DuckDBPyConnection:
+        return duckdb.connect(self.db_path)
+
+    def _ensure_tables(self):
+        with self._conn() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS bars (
+                    symbol VARCHAR, market VARCHAR, timestamp TIMESTAMP,
+                    open DOUBLE, high DOUBLE, low DOUBLE,
+                    close DOUBLE, volume DOUBLE
+                );
+            """)
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_bars_unique
+                ON bars (symbol, market, timestamp);
+            """)
+
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS tw_chips (
+                    symbol VARCHAR, date DATE,
+                    foreign_buy DOUBLE, foreign_sell DOUBLE, foreign_net DOUBLE,
+                    trust_buy DOUBLE, trust_sell DOUBLE, trust_net DOUBLE,
+                    dealer_net DOUBLE, margin_balance DOUBLE,
+                    short_balance DOUBLE, day_trade_volume DOUBLE
+                );
+            """)
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tw_chips_unique
+                ON tw_chips (symbol, date);
+            """)
+
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS us_options (
+                    symbol VARCHAR, date DATE, expiry DATE,
+                    option_type VARCHAR, strike DOUBLE,
+                    volume DOUBLE, open_interest DOUBLE,
+                    implied_volatility DOUBLE, bid DOUBLE,
+                    ask DOUBLE, last_price DOUBLE
+                );
+            """)
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_us_options_unique
+                ON us_options (symbol, date, expiry, option_type, strike);
+            """)
+
+    # ---------- bars ----------
+
+    def upsert_bars(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+
+        required = ["symbol", "market", "timestamp",
+                    "open", "high", "low", "close", "volume"]
+        for col in required:
+            if col not in df.columns:
+                raise ValueError(f"upsert_bars missing column: {col}")
+
+        df = df[required].copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["market"] = df["market"].apply(_market_str)
+
+        with self._conn() as con:
+            con.register("incoming", df)
+            con.execute("""
+                DELETE FROM bars
+                WHERE (symbol, market, timestamp) IN (
+                    SELECT symbol, market, timestamp FROM incoming
+                );
+            """)
+            con.execute("INSERT INTO bars SELECT * FROM incoming;")
+            con.unregister("incoming")
+
+    def save_bars_parquet(self, df: pd.DataFrame, market: str):
+        if df is None or df.empty:
+            return
+        df = df.copy()
+        df["market"] = df["market"].apply(_market_str)
+        market_str = _market_str(market)
+
+        for symbol, group in df.groupby("symbol"):
+            path = PARQUET_DIR / f"{market_str.lower()}_bars" / f"symbol={symbol}"
+            path.mkdir(parents=True, exist_ok=True)
+            group.reset_index(drop=True).to_parquet(
+                path / "data.parquet", index=False
+            )
+
+    def query_bars(
+        self, symbol: str, market,
+        start: str | None = None, end: str | None = None,
+    ) -> pd.DataFrame:
+        sql = "SELECT * FROM bars WHERE symbol = ? AND market = ?"
+        params: list = [symbol, _market_str(market)]
+
+        if start:
+            sql += " AND timestamp >= ?"
+            params.append(pd.Timestamp(start))
+        if end:
+            sql += " AND timestamp <= ?"
+            params.append(pd.Timestamp(end))
+
+        sql += " ORDER BY timestamp"
+
+        with self._conn() as con:
+            df = con.execute(sql, params).df()
+
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df
+
+    # ---------- tw_chips ----------
+
+    def upsert_tw_chips(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+
+        expected = [
+            "symbol", "date", "foreign_buy", "foreign_sell", "foreign_net",
+            "trust_buy", "trust_sell", "trust_net", "dealer_net",
+            "margin_balance", "short_balance", "day_trade_volume",
+        ]
+        for col in expected:
+            if col not in df.columns:
+                df[col] = 0.0
+        df = df[expected]
+
+        with self._conn() as con:
+            con.register("incoming_chips", df)
+            con.execute("""
+                DELETE FROM tw_chips
+                WHERE (symbol, date) IN (SELECT symbol, date FROM incoming_chips);
+            """)
+            con.execute("INSERT INTO tw_chips SELECT * FROM incoming_chips;")
+            con.unregister("incoming_chips")
+
+    def query_tw_chips(
+        self, symbol: str,
+        start: str | None = None, end: str | None = None,
+    ) -> pd.DataFrame:
+        sql = "SELECT * FROM tw_chips WHERE symbol = ?"
+        params: list = [symbol]
+
+        if start:
+            sql += " AND date >= ?"
+            params.append(pd.Timestamp(start).date())
+        if end:
+            sql += " AND date <= ?"
+            params.append(pd.Timestamp(end).date())
+
+        sql += " ORDER BY date"
+
+        with self._conn() as con:
+            df = con.execute(sql, params).df()
+
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # ---------- us_options ----------
+
+    def upsert_us_options(self, df: pd.DataFrame):
+        if df is None or df.empty:
+            return
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+
+        expected = [
+            "symbol", "date", "expiry", "option_type", "strike",
+            "volume", "open_interest", "implied_volatility",
+            "bid", "ask", "last_price",
+        ]
+        for col in expected:
+            if col not in df.columns:
+                df[col] = 0.0
+        df = df[expected]
+
+        with self._conn() as con:
+            con.register("incoming_options", df)
+            con.execute("""
+                DELETE FROM us_options
+                WHERE (symbol, date, expiry, option_type, strike) IN (
+                    SELECT symbol, date, expiry, option_type, strike
+                    FROM incoming_options
+                );
+            """)
+            con.execute("INSERT INTO us_options SELECT * FROM incoming_options;")
+            con.unregister("incoming_options")
+
+    def query_us_options(self, symbol: str, date: str | None = None) -> pd.DataFrame:
+        sql = "SELECT * FROM us_options WHERE symbol = ?"
+        params: list = [symbol]
+
+        if date:
+            sql += " AND date = ?"
+            params.append(pd.Timestamp(date).date())
+
+        sql += " ORDER BY expiry, option_type, strike"
+
+        with self._conn() as con:
+            return con.execute(sql, params).df()
+```
+
+**修復記錄**：第 2 輪 DuckDB UPSERT 改為 DELETE + INSERT；Parquet 分區修正；enum 轉換統一。
+
+---
+
+## 2.3 `app/data/finmind_provider.py`
+
+**職責**：FinMind 台股數據接入。
+
+```python
+import pandas as pd
+from FinMind.data import DataLoader
+
+from app.config import settings
+from app.data.base import DataProvider
+from app.data.warehouse import MarketWarehouse
+from app.domain.models import Market, NewsItem
+
+
+class FinMindProvider(DataProvider):
+    def __init__(self):
+        self.dl = DataLoader()
+        if settings.finmind_token:
+            try:
+                self.dl.login_by_token(api_token=settings.finmind_token)
+            except Exception as e:
+                print(f"FinMind login failed: {e}")
+        self.warehouse = MarketWarehouse()
+
+    async def get_bars(
+        self, symbol: str, market: Market,
+        start: str, end: str, interval: str = "1d",
+    ) -> pd.DataFrame:
+        if market != Market.TW:
+            raise ValueError("FinMindProvider only supports TW")
+
+        cached = self.warehouse.query_bars(symbol, market, start, end)
+        if not cached.empty:
+            return cached
+
+        try:
+            df = self.dl.taiwan_stock_daily(
+                stock_id=symbol, start_date=start, end_date=end,
+            )
+        except Exception as e:
+            print(f"FinMind fetch error: {e}")
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.rename(columns={
+            "date": "timestamp",
+            "max": "high",
+            "min": "low",
+            "Trading_Volume": "volume",
+        })
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["symbol"] = symbol
+        df["market"] = Market.TW.value
+
+        df = df[["timestamp", "symbol", "market",
+                 "open", "high", "low", "close", "volume"]]
+
+        self.warehouse.upsert_bars(df)
+        self.warehouse.save_bars_parquet(df, Market.TW.value)
+        return df
+
+    async def get_fundamentals(self, symbol: str, market: Market) -> dict:
+        return {}
+
+    async def get_news(self, symbol: str, market: Market, limit: int = 20) -> list[NewsItem]:
+        return []
+```
+
+**已知限制**：`get_fundamentals` 和 `get_news` 是佔位實現。
+
+---
+
+## 2.4 `app/data/yfinance_provider.py`
+
+**職責**：yfinance 美股數據接入。
+
+```python
+import pandas as pd
+import yfinance as yf
+
+from app.data.base import DataProvider
+from app.data.warehouse import MarketWarehouse
+from app.domain.models import Market, NewsItem
+
+
+class YFinanceProvider(DataProvider):
+    def __init__(self):
+        self.warehouse = MarketWarehouse()
+
+    async def get_bars(
+        self, symbol: str, market: Market,
+        start: str, end: str, interval: str = "1d",
+    ) -> pd.DataFrame:
+        cached = self.warehouse.query_bars(symbol, market, start, end)
+        if not cached.empty:
+            return cached
+
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start, end=end,
+                                interval=interval, auto_adjust=False)
+        except Exception as e:
+            print(f"yfinance fetch error: {e}")
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.reset_index()
+        df = df.rename(columns={
+            "Date": "timestamp", "Open": "open", "High": "high",
+            "Low": "low", "Close": "close", "Volume": "volume",
+        })
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+        df["symbol"] = symbol
+        df["market"] = Market.US.value
+
+        df = df[["timestamp", "symbol", "market",
+                 "open", "high", "low", "close", "volume"]]
+
+        self.warehouse.upsert_bars(df)
+        self.warehouse.save_bars_parquet(df, Market.US.value)
+        return df
+
+    async def get_fundamentals(self, symbol: str, market: Market) -> dict:
+        try:
+            info = yf.Ticker(symbol).info
+            return info or {}
+        except Exception:
+            return {}
+
+    async def get_news(self, symbol: str, market: Market, limit: int = 20) -> list[NewsItem]:
+        try:
+            raw = yf.Ticker(symbol).news or []
+        except Exception:
+            return []
+
+        out = []
+        for item in raw[:limit]:
+            published_at = None
+            if item.get("providerPublishTime"):
+                published_at = pd.to_datetime(item["providerPublishTime"], unit="s")
+
+            out.append(NewsItem(
+                title=item.get("title", ""),
+                summary=item.get("summary"),
+                url=item.get("link"),
+                published_at=published_at,
+                source=item.get("publisher"),
+            ))
+        return out
+```
+
+---
+
+## 2.5 `app/data/composite.py`
+
+**職責**：組合數據提供者。
+
+```python
+from app.data.base import DataProvider
+from app.data.finmind_provider import FinMindProvider
+from app.data.yfinance_provider import YFinanceProvider
+from app.domain.models import Market, NewsItem
+
+
+class CompositeProvider(DataProvider):
+    def __init__(self):
+        self.tw = FinMindProvider()
+        self.us = YFinanceProvider()
+
+    def _pick(self, market: Market) -> DataProvider:
+        if market == Market.TW:
+            return self.tw
+        if market == Market.US:
+            return self.us
+        raise ValueError(f"Unsupported market: {market}")
+
+    async def get_bars(
+        self, symbol: str, market: Market,
+        start: str, end: str, interval: str = "1d",
+    ):
+        return await self._pick(market).get_bars(symbol, market, start, end, interval)
+
+    async def get_fundamentals(self, symbol: str, market: Market) -> dict:
+        return await self._pick(market).get_fundamentals(symbol, market)
+
+    async def get_news(
+        self, symbol: str, market: Market, limit: int = 20,
+    ) -> list[NewsItem]:
+        return await self._pick(market).get_news(symbol, market, limit)
+```
+
+**修復記錄**：第 1 輪改用明確簽名。
+
+---
+
+# Part 3：回測層
+
+## 3.1 `app/backtest/signal_dsl.py`
+
+**職責**：輕量級信號 DSL 解析器，支援嵌套函數與高階時序運算。
+
+支援函數：
+- 基礎：`sma, ema, mean, std, stdev, rsi, atr, zscore, highest, lowest, max, min, slope`
+- 時序：`delay, delta, ts_rank, ts_argmax, ts_argmin, ts_sum, ts_mean, ts_std, ts_min, ts_max`
+- 截面：`rank, sign, abs, log`
+- 雙序列：`correlation, covariance`
+- 分位：`quantile`
+- 其他：`signedpower, rsquare, residual`
+
+```python
+import re
+
+import numpy as np
+import pandas as pd
+
+
+class SignalDSL:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy().reset_index(drop=True)
+
+        for col in ["close", "open", "high", "low", "volume"]:
+            if col not in self.df.columns:
+                self.df[col] = np.nan
+
+        self.df["returns"] = self.df["close"].pct_change()
+        self.df["vwap"] = (
+            (self.df["high"] + self.df["low"] + self.df["close"]) / 3
+        )
+
+    # ---------- 基礎指標 ----------
+
+    def sma(self, col, n):
+        return self.df[col].rolling(int(n)).mean()
+
+    def mean(self, col, n):
+        return self.df[col].rolling(int(n)).mean()
+
+    def ema(self, col, n):
+        return self.df[col].ewm(span=int(n), adjust=False).mean()
+
+    def std(self, col, n):
+        return self.df[col].rolling(int(n)).std()
+
+    def stdev(self, col, n):
+        return self.df[col].rolling(int(n)).std()
+
+    def rsi(self, col, n=14):
+        n = int(n)
+        delta = self.df[col].diff()
+        gain = delta.clip(lower=0).rolling(n).mean()
+        loss = (-delta.clip(upper=0)).rolling(n).mean()
+        rs = gain / (loss + 1e-9)
+        return 100 - 100 / (1 + rs)
+
+    def atr(self, n=14):
+        n = int(n)
+        tr = pd.concat([
+            self.df["high"] - self.df["low"],
+            (self.df["high"] - self.df["close"].shift()).abs(),
+            (self.df["low"] - self.df["close"].shift()).abs(),
+        ], axis=1).max(axis=1)
+        return tr.rolling(n).mean()
+
+    def zscore(self, col, n):
+        n = int(n)
+        m = self.df[col].rolling(n).mean()
+        s = self.df[col].rolling(n).std() + 1e-9
+        return (self.df[col] - m) / s
+
+    def highest(self, col, n):
+        return self.df[col].rolling(int(n)).max()
+
+    def lowest(self, col, n):
+        return self.df[col].rolling(int(n)).min()
+
+    def max(self, col, n):
+        return self.df[col].rolling(int(n)).max()
+
+    def min(self, col, n):
+        return self.df[col].rolling(int(n)).min()
+
+    def slope(self, col, n):
+        n = int(n)
+
+        def _slope(x):
+            if len(x) < 2 or np.isnan(x).all():
+                return np.nan
+            return np.polyfit(range(len(x)), x, 1)[0]
+
+        return self.df[col].rolling(n).apply(_slope, raw=True)
+
+    # ---------- 時序函數 ----------
+
+    def delay(self, col, n):
+        return self.df[col].shift(int(n))
+
+    def delta(self, col, n):
+        return self.df[col].diff(int(n))
+
+    def ts_sum(self, col, n):
+        return self.df[col].rolling(int(n)).sum()
+
+    def ts_mean(self, col, n):
+        return self.df[col].rolling(int(n)).mean()
+
+    def ts_std(self, col, n):
+        return self.df[col].rolling(int(n)).std()
+
+    def ts_min(self, col, n):
+        return self.df[col].rolling(int(n)).min()
+
+    def ts_max(self, col, n):
+        return self.df[col].rolling(int(n)).max()
+
+    def ts_rank(self, col, n):
+        n = int(n)
+
+        def _rank(x):
+            if len(x) < 2:
+                return np.nan
+            return (x[:-1] < x[-1]).sum() / (len(x) - 1)
+
+        return self.df[col].rolling(n).apply(_rank, raw=True)
+
+    def ts_argmax(self, col, n):
+        n = int(n)
+        return self.df[col].rolling(n).apply(
+            lambda x: len(x) - 1 - np.argmax(x) if not np.isnan(x).all() else np.nan,
+            raw=True,
+        )
+
+    def ts_argmin(self, col, n):
+        n = int(n)
+        return self.df[col].rolling(n).apply(
+            lambda x: len(x) - 1 - np.argmin(x) if not np.isnan(x).all() else np.nan,
+            raw=True,
+        )
+
+    # ---------- 截面函數 ----------
+
+    def rank(self, col):
+        return self.df[col].rank(pct=True)
+
+    def sign(self, col):
+        return np.sign(self.df[col])
+
+    def abs(self, col):
+        return np.abs(self.df[col])
+
+    def log(self, col):
+        return np.log(self.df[col].clip(lower=1e-9))
+
+    # ---------- 雙序列 ----------
+
+    def correlation(self, col1, col2, n):
+        n = int(n)
+        return self.df[col1].rolling(n).corr(self.df[col2])
+
+    def covariance(self, col1, col2, n):
+        n = int(n)
+        return self.df[col1].rolling(n).cov(self.df[col2])
+
+    # ---------- 分位 ----------
+
+    def quantile(self, col, n, q):
+        n = int(n)
+        q = float(q)
+        return self.df[col].rolling(n).quantile(q)
+
+    # ---------- 其他 ----------
+
+    def signedpower(self, col, power):
+        power = float(power)
+        return np.sign(self.df[col]) * (np.abs(self.df[col]) ** power)
+
+    def rsquare(self, col, n):
+        n = int(n)
+
+        def _r2(x):
+            if len(x) < 2 or np.isnan(x).all():
+                return np.nan
+            t = np.arange(len(x))
+            corr = np.corrcoef(t, x)[0, 1]
+            return corr ** 2 if not np.isnan(corr) else np.nan
+
+        return self.df[col].rolling(n).apply(_r2, raw=True)
+
+    def residual(self, col, n):
+        n = int(n)
+
+        def _resid(x):
+            if len(x) < 2 or np.isnan(x).all():
+                return np.nan
+            t = np.arange(len(x))
+            try:
+                slope, intercept = np.polyfit(t, x, 1)
+                return x[-1] - (slope * t[-1] + intercept)
+            except Exception:
+                return np.nan
+
+        return self.df[col].rolling(n).apply(_resid, raw=True)
+
+    # ---------- 表達式求值 ----------
+
+    def evaluate(self, expr: str) -> pd.Series:
+        try:
+            expr = str(expr).strip()
+        except Exception:
+            return pd.Series(0, index=self.df.index)
+
+        max_iter = 20
+        for _ in range(max_iter):
+            m = re.search(r"(\w+)\(([^()]*)\)", expr)
+            if not m:
+                break
+
+            func = m.group(1)
+            args_str = m.group(2)
+
+            parsed = []
+            for a in args_str.split(","):
+                a = a.strip()
+                if not a:
+                    continue
+                if a in ("close", "open", "high", "low", "volume", "returns", "vwap"):
+                    parsed.append(f"'{a}'")
+                    continue
+                try:
+                    parsed.append(str(int(a)))
+                    continue
+                except ValueError:
+                    pass
+                try:
+                    parsed.append(str(float(a)))
+                    continue
+                except ValueError:
+                    pass
+                parsed.append(a)
+
+            replacement = f"__RESULT_{abs(hash(m.group(0))) % 1000000}__"
+
+            if hasattr(self, func):
+                try:
+                    args_eval = []
+                    for p in parsed:
+                        if p.startswith("'"):
+                            args_eval.append(p.strip("'"))
+                        elif p.lstrip("-").isdigit():
+                            args_eval.append(int(p))
+                        else:
+                            try:
+                                args_eval.append(float(p))
+                            except ValueError:
+                                args_eval.append(p)
+
+                    result = getattr(self, func)(*args_eval)
+                    if isinstance(result, pd.Series):
+                        expr = expr.replace(m.group(0), replacement)
+                        if not hasattr(self, "_results"):
+                            self._results = {}
+                        self._results[replacement] = result
+                        continue
+                except Exception:
+                    pass
+
+            expr = expr.replace(m.group(0), "0")
+
+        for var in ["close", "open", "high", "low", "volume", "returns", "vwap"]:
+            expr = re.sub(rf"\b{var}\b", f"self.df['{var}']", expr)
+
+        if hasattr(self, "_results"):
+            for key in list(self._results.keys()):
+                expr = expr.replace(key, f"self._results['{key}']")
+
+        try:
+            result = eval(expr, {"__builtins__": {}},
+                          {"self": self, "np": np, "pd": pd})
+            if isinstance(result, pd.Series):
+                return result
+            if isinstance(result, (int, float, np.number)):
+                return pd.Series(float(result), index=self.df.index)
+        except Exception as e:
+            print(f"DSL eval error: {e} | expr={expr}")
+
+        return pd.Series(0, index=self.df.index)
+
+    def discretize(self, score: pd.Series, upper: float = 0.5, lower: float = -0.5) -> pd.Series:
+        pos = pd.Series(0, index=score.index)
+        pos[score > upper] = 1
+        pos[score < lower] = -1
+        return pos
+```
+
+**修復記錄**：
+- 第 1 輪：正則替換邏輯改為提取 + 還原雙階段。
+- 第 3 輪：擴展約 20 個高階函數。
+
+---
+
+## 3.2 `app/backtest/engine.py`
+
+**職責**：事件驅動回測引擎，含交割佔用資金、滑點、風控。
+
+```python
+import pandas as pd
+
+from app.domain.models import Market, Side
+from app.markets.registry import get_rules
+
+
+class BacktestEngine:
+    def __init__(
+        self,
+        market: Market,
+        initial_cash: float = 1_000_000.0,
+        slippage_pct: float = 0.001,
+        position_pct: float = 0.1,
+        risk_guard=None,
+    ):
+        self.market = market
+        self.rules = get_rules(market)
+        self.initial_cash = initial_cash
+        self.slippage_pct = slippage_pct
+        self.position_pct = position_pct
+        self.risk_guard = risk_guard
+
+        self.cash = initial_cash
+        self.receivable: list[tuple] = []
+        self.positions: dict[str, int] = {}
+        self.trades: list[dict] = []
+        self.equity_curve: list[dict] = []
+
+    def _settle(self, current_date):
+        remaining = []
+        for settle_date, amount in self.receivable:
+            if current_date >= settle_date:
+                self.cash += amount
+            else:
+                remaining.append((settle_date, amount))
+        self.receivable = remaining
+
+    def _calc_equity(self, current_price: float) -> float:
+        receivable_amount = sum(amount for _, amount in self.receivable)
+        position_value = sum(
+            qty * current_price for qty in self.positions.values()
+        )
+        return self.cash + receivable_amount + position_value
+
+    def run(self, bars: pd.DataFrame, signals: pd.Series) -> dict:
+        if bars is None or bars.empty:
+            return {"trades": [], "equity_curve": [], "final_cash": self.cash,
+                    "positions": {}, "metrics": {}}
+
+        df = bars.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        symbol = str(df["symbol"].iloc[0]) if "symbol" in df.columns else "UNKNOWN"
+        prev_close = None
+
+        if self.risk_guard is not None:
+            self.risk_guard.update_equity(self.cash)
+            self.risk_guard.reset_daily(self.cash)
+
+        for i, row in df.iterrows():
+            current_date = row["timestamp"]
+            self._settle(current_date)
+
+            signal = float(signals.iloc[i]) if i < len(signals) else 0.0
+            price = float(row["close"])
+
+            if pd.isna(price) or price <= 0:
+                equity = self._calc_equity(price if not pd.isna(price) else 0)
+                self.equity_curve.append({
+                    "date": current_date, "equity": equity,
+                    "cash": self.cash,
+                    "receivable": sum(a for _, a in self.receivable),
+                })
+                continue
+
+            equity = self._calc_equity(price)
+
+            if self.risk_guard is not None:
+                self.risk_guard.update_equity(equity)
+
+            if signal > 0 and prev_close is not None:
+                if self.rules.can_execute(Side.BUY, price, prev_close):
+                    target_value = equity * self.position_pct
+                    qty = self.rules.round_lot(int(target_value / price)) if price > 0 else 0
+
+                    if qty > 0:
+                        if self.risk_guard is not None:
+                            check = self.risk_guard.check_order(
+                                symbol, "BUY", qty, price,
+                                portfolio_value=equity,
+                                current_position_value=self.positions.get(symbol, 0) * price,
+                                current_equity=equity,
+                            )
+                            if not check["approved"]:
+                                qty = 0
+                            else:
+                                qty = check.get("adjusted_qty", qty)
+
+                        if qty > 0:
+                            buy_price = price * (1 + self.slippage_pct)
+                            fee = self.rules.calc_fees(Side.BUY, buy_price, qty)
+                            cost = buy_price * qty + fee
+                            if cost <= self.cash:
+                                self.cash -= cost
+                                self.positions[symbol] = self.positions.get(symbol, 0) + qty
+                                self.trades.append({
+                                    "date": current_date, "side": "BUY",
+                                    "price": buy_price, "qty": qty, "fee": fee,
+                                })
+
+            elif signal < 0 and self.positions.get(symbol, 0) > 0:
+                if prev_close is not None and self.rules.can_execute(Side.SELL, price, prev_close):
+                    qty = self.positions[symbol]
+
+                    if self.risk_guard is not None:
+                        check = self.risk_guard.check_order(
+                            symbol, "SELL", qty, price,
+                            portfolio_value=equity,
+                            current_position_value=qty * price,
+                            current_equity=equity,
+                        )
+                        if not check["approved"]:
+                            qty = 0
+
+                    if qty > 0:
+                        sell_price = price * (1 - self.slippage_pct)
+                        fee = self.rules.calc_fees(Side.SELL, sell_price, qty)
+                        proceeds = sell_price * qty - fee
+                        settle_date = self.rules.settlement_date(current_date)
+
+                        self.receivable.append((settle_date, proceeds))
+                        self.positions[symbol] = 0
+                        self.trades.append({
+                            "date": current_date, "side": "SELL",
+                            "price": sell_price, "qty": qty, "fee": fee,
+                            "settle_date": settle_date,
+                        })
+
+            prev_close = price
+
+            equity = self._calc_equity(price)
+            self.equity_curve.append({
+                "date": current_date, "equity": equity,
+                "cash": self.cash,
+                "receivable": sum(a for _, a in self.receivable),
+            })
+
+        return {
+            "trades": self.trades,
+            "equity_curve": self.equity_curve,
+            "final_cash": self.cash,
+            "positions": self.positions,
+        }
+```
+
+**修復記錄**：
+- 第 2 輪：統一簽名，加入 `slippage_pct` 和 `risk_guard`。
+- 第 3 輪：修正風控整合時的 `equity` 變數未定義問題。
+
+---
+
+## 3.3 `app/backtest/walk_forward.py`
+
+**職責**：Walk-Forward + CSCV 過擬合檢測。
+
+```python
+import numpy as np
+import pandas as pd
+from itertools import combinations
+
+
+class WalkForwardEngine:
+    def __init__(
+        self,
+        train_window: int = 252,
+        test_window: int = 63,
+        step: int = 63,
+        n_splits: int = 10,
+    ):
+        self.train_window = train_window
+        self.test_window = test_window
+        self.step = step
+        self.n_splits = n_splits
+
+    def walk_forward(self, bars, signal_fn, backtest_fn) -> dict:
+        df = bars.copy().reset_index(drop=True)
+        n = len(df)
+        results = []
+
+        start = 0
+        while start + self.train_window + self.test_window <= n:
+            train = df.iloc[start : start + self.train_window]
+            test = df.iloc[
+                start + self.train_window :
+                start + self.train_window + self.test_window
+            ]
+
+            signal_gen = signal_fn(train)
+            signals = signal_gen(test)
+
+            result = backtest_fn(test, signals)
+            result["window"] = {
+                "train_start": str(train["timestamp"].iloc[0]),
+                "train_end": str(train["timestamp"].iloc[-1]),
+                "test_start": str(test["timestamp"].iloc[0]),
+                "test_end": str(test["timestamp"].iloc[-1]),
+            }
+            results.append(result)
+            start += self.step
+
+        all_trades = []
+        all_equity = []
+        for i, r in enumerate(results):
+            for t in r.get("trades", []):
+                t["window_idx"] = i
+                all_trades.append(t)
+            for e in r.get("equity_curve", []):
+                e["window_idx"] = i
+                all_equity.append(e)
+
+        return {
+            "windows": results,
+            "summary": self._summarize(results),
+            "all_trades": all_trades,
+            "all_equity": all_equity,
+        }
+
+    def _summarize(self, results) -> dict:
+        sharpes, returns, drawdowns = [], [], []
+
+        for r in results:
+            eq = pd.DataFrame(r.get("equity_curve", []))
+            if eq.empty:
+                continue
+            eq["return"] = eq["equity"].pct_change()
+            sharpe = eq["return"].mean() / (eq["return"].std() + 1e-9) * (252 ** 0.5)
+            total_ret = eq["equity"].iloc[-1] / eq["equity"].iloc[0] - 1
+            max_dd = ((eq["equity"] / eq["equity"].cummax()) - 1).min()
+            sharpes.append(sharpe)
+            returns.append(total_ret)
+            drawdowns.append(max_dd)
+
+        if not sharpes:
+            return {}
+
+        return {
+            "num_windows": len(sharpes),
+            "sharpe_mean": round(float(np.mean(sharpes)), 4),
+            "sharpe_std": round(float(np.std(sharpes)), 4),
+            "sharpe_min": round(float(np.min(sharpes)), 4),
+            "sharpe_max": round(float(np.max(sharpes)), 4),
+            "return_mean": round(float(np.mean(returns)), 4),
+            "return_win_rate": round(sum(1 for r in returns if r > 0) / len(returns), 4),
+            "max_drawdown_mean": round(float(np.mean(drawdowns)), 4),
+            "oos_consistency": round(
+                float(np.mean(sharpes)) / (float(np.std(sharpes)) + 1e-9), 4
+            ),
+        }
+
+    def cscv(self, bars, signal_candidates, backtest_fn) -> dict:
+        n = len(bars)
+        split_size = n // self.n_splits
+        if split_size < 10:
+            return {"error": "not enough data for CSCV"}
+
+        splits = []
+        for i in range(self.n_splits):
+            start = i * split_size
+            end = start + split_size
+            splits.append(bars.iloc[start:end].copy())
+
+        perf_matrix = {}
+        for name, sig_fn in signal_candidates.items():
+            perfs = []
+            for s in splits:
+                signals = sig_fn(s)
+                result = backtest_fn(s, signals)
+                eq = pd.DataFrame(result.get("equity_curve", []))
+                if eq.empty:
+                    perfs.append(0)
+                    continue
+                eq["return"] = eq["equity"].pct_change()
+                sharpe = eq["return"].mean() / (eq["return"].std() + 1e-9) * (252 ** 0.5)
+                perfs.append(sharpe)
+            perf_matrix[name] = perfs
+
+        n_comb = self.n_splits // 2
+        combo_indices = list(combinations(range(self.n_splits), n_comb))
+        n_combos = len(combo_indices)
+
+        if n_combos > 5000:
+            idx = np.random.choice(n_combos, 5000, replace=False)
+            combo_indices = [combo_indices[i] for i in idx]
+
+        logits = []
+        for combo in combo_indices:
+            is_idx = list(combo)
+            oos_idx = [i for i in range(self.n_splits) if i not in combo]
+
+            is_perf = {name: np.mean([perfs[i] for i in is_idx])
+                       for name, perfs in perf_matrix.items()}
+            oos_perf = {name: np.mean([perfs[i] for i in oos_idx])
+                        for name, perfs in perf_matrix.items()}
+
+            best_is = max(is_perf, key=is_perf.get)
+            rank_oos = sorted(oos_perf, key=oos_perf.get, reverse=True)
+            rank = rank_oos.index(best_is) + 1
+
+            omega = rank / (len(rank_oos) + 1)
+            logit = np.log(omega / (1 - omega + 1e-9))
+            logits.append(logit)
+
+        pbo = sum(1 for l in logits if l <= 0) / len(logits)
+
+        return {
+            "PBO": round(pbo, 4),
+            "interpretation": (
+                "低過擬合風險" if pbo < 0.2
+                else "中等過擬合風險" if pbo < 0.5
+                else "高過擬合風險"
+            ),
+            "num_combinations": len(logits),
+            "perf_matrix": perf_matrix,
+        }
+```
+
+**修復記錄**：第 1 輪刪除未使用的 `from math import comb`。
+
+---
+
+## 3.4 `app/backtest/neutrino_engine.py`
+
+**職責**：Numba 向量化回測引擎。
+
+```python
+import numpy as np
+import pandas as pd
+
+
+class NeutrinoEngine:
+    def __init__(self):
+        self._available = self._check_available()
+
+    def _check_available(self) -> bool:
+        try:
+            import numba
+            self.numba = numba
+            return True
+        except ImportError:
+            return False
+
+    def vectorized_backtest(
+        self, close, signals,
+        fee_rate: float = 0.001,
+        slippage_pct: float = 0.001,
+        initial_capital: float = 1_000_000,
+    ) -> dict:
+        close = np.asarray(close, dtype=np.float64)
+        signals = np.asarray(signals, dtype=np.float64)
+
+        if len(close) != len(signals):
+            return {"error": "close and signals must have same length"}
+
+        if self._available:
+            return self._backtest_numba(close, signals, fee_rate, slippage_pct, initial_capital)
+        return self._backtest_python(close, signals, fee_rate, slippage_pct, initial_capital)
+
+    def _backtest_python(self, close, signals, fee_rate, slippage_pct, initial_capital) -> dict:
+        n = len(close)
+        cash = float(initial_capital)
+        position = 0.0
+        equity = np.zeros(n)
+        equity[0] = cash
+        trades = []
+        prev_signal = 0.0
+
+        for i in range(1, n):
+            sig = signals[i]
+            price = close[i]
+            if np.isnan(price) or price <= 0:
+                equity[i] = cash + position * (close[i - 1] if i > 0 else 0)
+                continue
+
+            if sig != prev_signal:
+                if position > 0 and sig <= 0:
+                    sell_price = price * (1 - slippage_pct)
+                    proceeds = position * sell_price * (1 - fee_rate)
+                    cash += proceeds
+                    trades.append({"index": i, "side": "SELL",
+                                   "price": sell_price, "qty": position})
+                    position = 0.0
+
+                if sig > 0 and position <= 0:
+                    buy_price = price * (1 + slippage_pct)
+                    qty = (cash * 0.95) / buy_price
+                    cost = qty * buy_price * (1 + fee_rate)
+                    if cost <= cash:
+                        cash -= cost
+                        position = qty
+                        trades.append({"index": i, "side": "BUY",
+                                       "price": buy_price, "qty": qty})
+
+            equity[i] = cash + position * price
+            prev_signal = sig
+
+        return self._calc_metrics(equity, trades, close)
+
+    def _backtest_numba(self, close, signals, fee_rate, slippage_pct, initial_capital) -> dict:
+        @self.numba.njit(cache=True)
+        def _kernel(close, signals, fee_rate, slippage_pct, initial_capital):
+            n = len(close)
+            cash = float(initial_capital)
+            position = 0.0
+            equity = np.zeros(n)
+            equity[0] = cash
+            trade_buf = np.zeros((n, 4), dtype=np.float64)
+            trade_count = 0
+            prev_signal = 0.0
+
+            for i in range(1, n):
+                sig = signals[i]
+                price = close[i]
+                if np.isnan(price) or price <= 0:
+                    equity[i] = cash + position * close[i - 1]
+                    continue
+
+                if sig != prev_signal:
+                    if position > 0 and sig <= 0:
+                        sell_price = price * (1 - slippage_pct)
+                        proceeds = position * sell_price * (1 - fee_rate)
+                        cash += proceeds
+                        trade_buf[trade_count, 0] = i
+                        trade_buf[trade_count, 1] = -1
+                        trade_buf[trade_count, 2] = sell_price
+                        trade_buf[trade_count, 3] = position
+                        trade_count += 1
+                        position = 0.0
+
+                    if sig > 0 and position <= 0:
+                        buy_price = price * (1 + slippage_pct)
+                        qty = (cash * 0.95) / buy_price
+                        cost = qty * buy_price * (1 + fee_rate)
+                        if cost <= cash:
+                            cash -= cost
+                            position = qty
+                            trade_buf[trade_count, 0] = i
+                            trade_buf[trade_count, 1] = 1
+                            trade_buf[trade_count, 2] = buy_price
+                            trade_buf[trade_count, 3] = qty
+                            trade_count += 1
+
+                equity[i] = cash + position * price
+                prev_signal = sig
+
+            return equity, trade_buf[:trade_count]
+
+        equity, trades = _kernel(close, signals, float(fee_rate),
+                                 float(slippage_pct), float(initial_capital))
+
+        trade_list = [
+            {"index": int(t[0]), "side": "BUY" if t[1] > 0 else "SELL",
+             "price": float(t[2]), "qty": float(t[3])}
+            for t in trades
+        ]
+        return self._calc_metrics(equity, trade_list, close)
+
+    def _calc_metrics(self, equity, trades, close) -> dict:
+        eq = pd.Series(equity)
+        eq = eq[eq > 0]
+        if len(eq) < 2:
+            return {"error": "insufficient data"}
+
+        returns = eq.pct_change().dropna()
+        total_return = float(eq.iloc[-1] / eq.iloc[0] - 1)
+        sharpe = float(returns.mean() / (returns.std() + 1e-9) * (252 ** 0.5))
+        max_dd = float(((eq / eq.cummax()) - 1).min())
+
+        downside = returns[returns < 0]
+        sortino = float(returns.mean() / (downside.std() + 1e-9) * (252 ** 0.5))
+        calmar = float(total_return / (abs(max_dd) + 1e-9))
+
+        return {
+            "total_return": round(total_return, 4),
+            "sharpe": round(sharpe, 4),
+            "sortino": round(sortino, 4),
+            "calmar": round(calmar, 4),
+            "max_drawdown": round(max_dd, 4),
+            "num_trades": len(trades),
+            "win_rate": self._calc_win_rate(trades),
+        }
+
+    def _calc_win_rate(self, trades) -> float:
+        if len(trades) < 2:
+            return 0.0
+        wins = 0
+        pairs = 0
+        for i in range(len(trades) - 1):
+            t1, t2 = trades[i], trades[i + 1]
+            if t1["side"] == "BUY" and t2["side"] == "SELL":
+                if t2["price"] > t1["price"]:
+                    wins += 1
+                pairs += 1
+        return round(wins / pairs, 4) if pairs > 0 else 0.0
+
+    def parameter_sweep(self, bars, strategy_fn, param_grid, max_combinations=5000) -> pd.DataFrame:
+        import itertools
+        import random
+
+        keys = list(param_grid.keys())
+        values = list(param_grid.values())
+        combinations = list(itertools.product(*values))
+
+        if len(combinations) > max_combinations:
+            random.seed(42)
+            combinations = random.sample(combinations, max_combinations)
+
+        close = bars["close"].values
+        results = []
+
+        for combo in combinations:
+            params = dict(zip(keys, combo))
+            try:
+                signals = strategy_fn(close, **params)
+                metrics = self.vectorized_backtest(close, signals)
+                if "error" not in metrics:
+                    metrics.update(params)
+                    results.append(metrics)
+            except Exception:
+                continue
+
+        df = pd.DataFrame(results)
+        if not df.empty:
+            df = df.sort_values("sharpe", ascending=False)
+        return df
+```
+
+**修復記錄**：第 3 輪 Numba 和 fallback 邏輯完全對齊。
+
+---
+
+## 3.5 `app/backtest/vectorbt_engine.py`
+
+**職責**：VectorBT 多資產組合回測包裝器。
+
+```python
+import numpy as np
+import pandas as pd
+
+
+class VectorBTEngine:
+    def __init__(self):
+        self._available = self._check_available()
+
+    def _check_available(self) -> bool:
+        try:
+            import vectorbt as vbt
+            self.vbt = vbt
+            return True
+        except ImportError:
+            return False
+
+    def ma_cross_sweep(self, close, fast_range, slow_range,
+                       fees=0.001425, slippage=0.001) -> pd.DataFrame:
+        if not self._available:
+            return pd.DataFrame({"error": ["vectorbt not installed"]})
+
+        fast_ma = self.vbt.MA.run(close, window=fast_range)
+        slow_ma = self.vbt.MA.run(close, window=slow_range)
+
+        entries = fast_ma.ma_crossed_above(slow_ma)
+        exits = fast_ma.ma_crossed_below(slow_ma)
+
+        pf = self.vbt.Portfolio.from_signals(
+            close, entries, exits, fees=fees, slippage=slippage, freq="1D",
+        )
+
+        return pd.DataFrame({
+            "total_return": pf.total_return(),
+            "sharpe": pf.sharpe_ratio(),
+            "max_drawdown": pf.max_drawdown(),
+            "win_rate": pf.trades.win_rate(),
+            "num_trades": pf.trades.count(),
+        }).sort_values("sharpe", ascending=False)
+
+    def multi_asset_portfolio(self, close_matrix, signals, fees=0.001425) -> dict:
+        if not self._available:
+            return {"error": "vectorbt not installed"}
+
+        entries = signals == 1
+        exits = signals == -1
+
+        pf = self.vbt.Portfolio.from_signals(
+            close_matrix, entries, exits, fees=fees, freq="1D",
+        )
+
+        return {
+            "total_return": float(pf.total_return()),
+            "sharpe": float(pf.sharpe_ratio()),
+            "max_drawdown": float(pf.max_drawdown()),
+            "per_asset": {
+                col: {
+                    "return": float(pf[col].total_return()),
+                    "sharpe": float(pf[col].sharpe_ratio()),
+                }
+                for col in close_matrix.columns
+            },
+        }
+```
+
+---
+
+# Part 4：風控層
+
+## 4.1 `app/risk/guard.py`
+
+**職責**：實盤風控引擎，台股 / 美股雙配置。
+
+```python
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+class RiskGuard:
+    def __init__(
+        self,
+        market: str = "TW",
+        max_position_pct: float = 0.15,
+        max_daily_loss_pct: float = 0.025,
+        max_drawdown_pct: float = 0.12,
+        cooldown_minutes: int = 60,
+        kelly_fraction: float = 0.4,
+        circuit_breaker_levels: dict | None = None,
+    ):
+        self.market = market
+        self.max_position_pct = max_position_pct
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.max_drawdown_pct = max_drawdown_pct
+        self.cooldown_minutes = cooldown_minutes
+        self.kelly_fraction = kelly_fraction
+
+        self.circuit_breaker_levels = circuit_breaker_levels or {
+            "reduce": 0.06, "halt": 0.10, "kill": 0.15,
+        }
+
+        self.peak_equity = 0.0
+        self.daily_start_equity = 0.0
+        self.circuit_breaker_until = None
+        self.circuit_breaker_level = "normal"
+        self.kill_switch_active = False
+
+    def update_equity(self, equity: float):
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+
+    def reset_daily(self, equity: float):
+        self.daily_start_equity = equity
+
+    def check_order(
+        self, symbol, side, qty, price,
+        portfolio_value, current_position_value=0.0, current_equity=1_000_000.0,
+    ) -> dict:
+        now = datetime.now()
+
+        if self.kill_switch_active:
+            return {"approved": False, "reason": "KILL_SWITCH_ACTIVE"}
+
+        if self.circuit_breaker_until and now < self.circuit_breaker_until:
+            return {
+                "approved": False,
+                "reason": f"CIRCUIT_BREAKER_{self.circuit_breaker_level.upper()}",
+                "until": self.circuit_breaker_until.isoformat(),
+            }
+
+        if self.peak_equity > 0:
+            dd = (self.peak_equity - current_equity) / self.peak_equity
+
+            if dd >= self.circuit_breaker_levels["kill"]:
+                self.circuit_breaker_until = now + timedelta(minutes=self.cooldown_minutes)
+                self.circuit_breaker_level = "kill"
+                return {"approved": False, "reason": f"KILL_DRAWDOWN_{dd:.2%}"}
+
+            if dd >= self.circuit_breaker_levels["halt"]:
+                self.circuit_breaker_level = "halt"
+                return {"approved": False, "reason": f"HALT_DRAWDOWN_{dd:.2%}"}
+
+            if dd >= self.circuit_breaker_levels["reduce"]:
+                self.circuit_breaker_level = "reduce"
+                return {"approved": True,
+                        "adjusted_qty": max(0, int(qty * 0.5)),
+                        "reason": f"REDUCE_DRAWDOWN_{dd:.2%}"}
+
+        if self.daily_start_equity > 0:
+            daily_loss = (self.daily_start_equity - current_equity) / self.daily_start_equity
+            if daily_loss > self.max_daily_loss_pct:
+                return {"approved": False, "reason": f"DAILY_LOSS_{daily_loss:.2%}"}
+
+        if side == "BUY" and price > 0:
+            new_position = current_position_value + qty * price
+            position_pct = new_position / (portfolio_value + 1e-9)
+
+            if position_pct > self.max_position_pct:
+                max_qty = int((self.max_position_pct * portfolio_value - current_position_value) / price)
+                max_qty = max(0, max_qty)
+                return {"approved": True, "adjusted_qty": max_qty,
+                        "reason": f"POSITION_LIMIT_{position_pct:.2%}"}
+
+        return {"approved": True, "adjusted_qty": qty, "reason": "PASS"}
+
+    def kelly_position(self, win_rate, avg_win, avg_loss, portfolio_value) -> float:
+        if avg_loss <= 0:
+            return 0.0
+        b = avg_win / avg_loss
+        p = win_rate
+        q = 1 - p
+        kelly = (p * b - q) / (b + 1e-9)
+        kelly = max(0.0, min(kelly, 0.25))
+        return portfolio_value * kelly * self.kelly_fraction
+
+    def activate_kill_switch(self, reason: str = "manual"):
+        self.kill_switch_active = True
+        self.circuit_breaker_until = datetime.now() + timedelta(minutes=self.cooldown_minutes)
+        return {"kill_switch": "ACTIVE", "reason": reason}
+
+    def deactivate_kill_switch(self):
+        self.kill_switch_active = False
+        self.circuit_breaker_until = None
+        return {"kill_switch": "INACTIVE"}
+
+    def persist(self, path: str):
+        state = {
+            "market": self.market,
+            "peak_equity": self.peak_equity,
+            "daily_start_equity": self.daily_start_equity,
+            "circuit_breaker_until": (
+                self.circuit_breaker_until.isoformat()
+                if self.circuit_breaker_until else None
+            ),
+            "circuit_breaker_level": self.circuit_breaker_level,
+            "kill_switch_active": self.kill_switch_active,
+            "saved_at": datetime.now().isoformat(),
+        }
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+
+    def load(self, path: str):
+        try:
+            with open(path) as f:
+                state = json.load(f)
+            self.peak_equity = state.get("peak_equity", 0.0)
+            self.daily_start_equity = state.get("daily_start_equity", 0.0)
+            self.circuit_breaker_level = state.get("circuit_breaker_level", "normal")
+            self.kill_switch_active = state.get("kill_switch_active", False)
+            cb = state.get("circuit_breaker_until")
+            self.circuit_breaker_until = datetime.fromisoformat(cb) if cb else None
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"RiskGuard load error: {e}")
+
+
+def build_tw_guard() -> RiskGuard:
+    return RiskGuard(market="TW", max_position_pct=0.15,
+                     max_daily_loss_pct=0.025, max_drawdown_pct=0.12,
+                     kelly_fraction=0.4)
+
+
+def build_us_guard() -> RiskGuard:
+    return RiskGuard(market="US", max_position_pct=0.20,
+                     max_daily_loss_pct=0.03, max_drawdown_pct=0.15,
+                     kelly_fraction=0.5)
+```
+
+---
+
+## 4.2 `app/risk/__init__.py`
+
+```python
+from app.risk.guard import RiskGuard, build_tw_guard, build_us_guard
+
+__all__ = ["RiskGuard", "build_tw_guard", "build_us_guard"]
+```
+
+---
+
+# Part 5：因子層
+
+## 5.1 `app/factors/registry.py`
+
+**職責**：因子註冊表，管理元數據、版本、生命週期。
+
+```python
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+
+class FactorRegistry:
+    def __init__(self, db_path: str = "./data_lake/factors.duckdb"):
+        self.db_path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_tables()
+
+    def _conn(self):
+        return duckdb.connect(self.db_path)
+
+    def _ensure_tables(self):
+        with self._conn() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS factors (
+                    factor_id VARCHAR, name VARCHAR, version INTEGER DEFAULT 1,
+                    expr VARCHAR, category VARCHAR, market VARCHAR,
+                    status VARCHAR DEFAULT 'draft',
+                    ic_mean DOUBLE, rank_ic_mean DOUBLE, lift DOUBLE,
+                    author VARCHAR, manifest_hash VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_factors_id
+                ON factors (factor_id);
+            """)
+            con.execute("""
+                CREATE INDEX IF NOT EXISTS idx_factors_name
+                ON factors (name);
+            """)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS factor_history (
+                    factor_id VARCHAR, version INTEGER, expr VARCHAR,
+                    ic_mean DOUBLE, rank_ic_mean DOUBLE, lift DOUBLE,
+                    change_reason VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+    def register(self, name, expr, category="unknown", market="BOTH", author="system") -> str:
+        factor_id = f"{name}_v1"
+        with self._conn() as con:
+            existing = con.execute(
+                "SELECT factor_id FROM factors WHERE name = ?", [name]
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Factor '{name}' already exists: {existing[0]}")
+
+            con.execute("""
+                INSERT INTO factors
+                (factor_id, name, version, expr, category, market, status, author)
+                VALUES (?, ?, 1, ?, ?, ?, 'draft', ?)
+            """, [factor_id, name, expr, category, market, author])
+        return factor_id
+
+    def validate(self, factor_id, ic_mean, rank_ic_mean, lift) -> dict:
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT factor_id FROM factors WHERE factor_id = ?", [factor_id]
+            ).fetchone()
+            if not row:
+                return {"error": "factor not found"}
+
+            new_status = "production" if lift > 0 else "validated"
+            con.execute("""
+                UPDATE factors
+                SET status = ?, ic_mean = ?, rank_ic_mean = ?, lift = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE factor_id = ?
+            """, [new_status, ic_mean, rank_ic_mean, lift, factor_id])
+
+            con.execute("""
+                INSERT INTO factor_history
+                (factor_id, version, expr, ic_mean, rank_ic_mean, lift, change_reason)
+                SELECT factor_id, version, expr, ?, ?, ?, 'validation'
+                FROM factors WHERE factor_id = ?
+            """, [ic_mean, rank_ic_mean, lift, factor_id])
+
+        return {"factor_id": factor_id, "status": new_status, "lift": lift,
+                "verdict": "入庫" if lift > 0 else "僅保留不入庫"}
+
+    def list_by_status(self, status: str = "production") -> list[dict]:
+        with self._conn() as con:
+            df = con.execute(
+                "SELECT * FROM factors WHERE status = ? ORDER BY rank_ic_mean DESC NULLS LAST",
+                [status],
+            ).df()
+        return df.to_dict("records")
+
+    def get_production_factors(self, market: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM factors WHERE status = 'production'"
+        params = []
+        if market:
+            sql += " AND (market = ? OR market = 'BOTH')"
+            params.append(market)
+        sql += " ORDER BY rank_ic_mean DESC NULLS LAST"
+
+        with self._conn() as con:
+            df = con.execute(sql, params).df()
+        return df.to_dict("records")
+```
+
+**修復記錄**：第 2 輪 DuckDB PRIMARY KEY 改為 UNIQUE INDEX。
+
+---
+
+## 5.2 `app/factors/tw_chips.py`
+
+**職責**：台股籌碼因子引擎。
+
+```python
+import pandas as pd
+from FinMind.data import DataLoader
+
+from app.config import settings
+from app.data.warehouse import MarketWarehouse
+
+
+FOREIGN_ALIASES = ["Foreign_Investor", "Foreign_Investor_Dealer",
+                   "外資", "外資及陸資", "外陸資"]
+TRUST_ALIASES = ["Investment_Trust", "投信", "投信自營商"]
+DEALER_ALIASES = ["Dealer_self", "Dealer_Hedging", "Dealer",
+                  "自營商", "自營商自行買賣", "自營商避險"]
+
+
+class TWChipsFactorEngine:
+    def __init__(self):
+        self.dl = DataLoader()
+        if settings.finmind_token:
+            try:
+                self.dl.login_by_token(api_token=settings.finmind_token)
+            except Exception as e:
+                print(f"FinMind login failed: {e}")
+        self.warehouse = MarketWarehouse()
+
+    def _safe_fetch(self, method_name: str, **kwargs) -> pd.DataFrame:
+        try:
+            method = getattr(self.dl, method_name, None)
+            if method is None:
+                return pd.DataFrame()
+            df = method(**kwargs)
+            return df if df is not None else pd.DataFrame()
+        except Exception as e:
+            print(f"FinMind fetch error ({method_name}): {e}")
+            return pd.DataFrame()
+
+    def fetch_institutional(self, symbol, start, end):
+        return self._safe_fetch("taiwan_stock_institutional_investors",
+                                stock_id=symbol, start_date=start, end_date=end)
+
+    def fetch_margin(self, symbol, start, end):
+        return self._safe_fetch("taiwan_stock_margin_purchase_short_sale",
+                                stock_id=symbol, start_date=start, end_date=end)
+
+    def fetch_day_trade(self, symbol, start, end):
+        return self._safe_fetch("taiwan_stock_day_trading",
+                                stock_id=symbol, start_date=start, end_date=end)
+
+    @staticmethod
+    def _match_alias(name_series, aliases):
+        mask = pd.Series(False, index=name_series.index)
+        for alias in aliases:
+            mask |= name_series.str.contains(alias, na=False, case=False)
+        return mask
+
+    def build_chip_table(self, symbol, start, end) -> pd.DataFrame:
+        inst = self.fetch_institutional(symbol, start, end)
+        margin = self.fetch_margin(symbol, start, end)
+        day_trade = self.fetch_day_trade(symbol, start, end)
+
+        rows = []
+
+        if not inst.empty and "date" in inst.columns:
+            for date, group in inst.groupby("date"):
+                foreign_mask = self._match_alias(group["name"], FOREIGN_ALIASES)
+                trust_mask = self._match_alias(group["name"], TRUST_ALIASES)
+                dealer_mask = self._match_alias(group["name"], DEALER_ALIASES)
+
+                def _sum(mask, col):
+                    if col not in group.columns:
+                        return 0.0
+                    return float(group.loc[mask, col].sum())
+
+                foreign_buy = _sum(foreign_mask, "buy")
+                foreign_sell = _sum(foreign_mask, "sell")
+                trust_buy = _sum(trust_mask, "buy")
+                trust_sell = _sum(trust_mask, "sell")
+                dealer_buy = _sum(dealer_mask, "buy")
+                dealer_sell = _sum(dealer_mask, "sell")
+
+                rows.append({
+                    "date": date, "symbol": symbol,
+                    "foreign_buy": foreign_buy, "foreign_sell": foreign_sell,
+                    "foreign_net": foreign_buy - foreign_sell,
+                    "trust_buy": trust_buy, "trust_sell": trust_sell,
+                    "trust_net": trust_buy - trust_sell,
+                    "dealer_net": dealer_buy - dealer_sell,
+                    "margin_balance": 0.0, "short_balance": 0.0,
+                    "day_trade_volume": 0.0,
+                })
+
+        chip = pd.DataFrame(rows)
+        if chip.empty:
+            return chip
+
+        chip = chip.set_index("date")
+
+        if not margin.empty and "date" in margin.columns:
+            margin = margin.set_index("date")
+            for col, target in [
+                ("MarginPurchaseTodayBalance", "margin_balance"),
+                ("MarginPurchaseBalance", "margin_balance"),
+                ("ShortSaleTodayBalance", "short_balance"),
+                ("ShortSaleBalance", "short_balance"),
+            ]:
+                if col in margin.columns:
+                    chip[target] = margin[col].reindex(chip.index).fillna(0.0)
+
+        if not day_trade.empty and "date" in day_trade.columns:
+            dt_col = None
+            for col in ["volume", "Volume", "trade_volume", "day_trade_volume"]:
+                if col in day_trade.columns:
+                    dt_col = col
+                    break
+            if dt_col:
+                dt = day_trade.groupby("date")[dt_col].sum()
+                chip["day_trade_volume"] = dt.reindex(chip.index).fillna(0.0)
+
+        chip = chip.reset_index()
+        chip["symbol"] = symbol
+        chip["date"] = pd.to_datetime(chip["date"])
+
+        try:
+            self.warehouse.upsert_tw_chips(chip)
+        except Exception as e:
+            print(f"Warehouse upsert failed: {e}")
+
+        return chip
+
+    def compute_factors(self, symbol, start, end) -> pd.DataFrame:
+        raw = self.warehouse.query_tw_chips(symbol, start, end)
+        if raw is None or raw.empty:
+            raw = self.build_chip_table(symbol, start, end)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        raw = raw.sort_values("date").reset_index(drop=True)
+        f = pd.DataFrame()
+        f["date"] = raw["date"]
+
+        if "foreign_net" in raw.columns:
+            f["foreign_net_5d"] = raw["foreign_net"].rolling(5, min_periods=1).sum()
+            f["foreign_net_20d"] = raw["foreign_net"].rolling(20, min_periods=1).sum()
+
+        if "trust_net" in raw.columns:
+            f["trust_net_5d"] = raw["trust_net"].rolling(5, min_periods=1).sum()
+            f["trust_net_20d"] = raw["trust_net"].rolling(20, min_periods=1).sum()
+
+        if "margin_balance" in raw.columns:
+            mb = raw["margin_balance"]
+            ma20 = mb.rolling(20, min_periods=1).mean()
+            f["margin_ratio"] = mb / (ma20 + 1e-9)
+
+        if "short_balance" in raw.columns and "margin_balance" in raw.columns:
+            f["short_margin_ratio"] = raw["short_balance"] / (raw["margin_balance"] + 1e-9)
+
+        if "day_trade_volume" in raw.columns:
+            dt = raw["day_trade_volume"]
+            f["day_trade_ratio"] = dt / (dt.rolling(20, min_periods=1).mean() + 1e-9)
+
+        if "foreign_net" in raw.columns and "trust_net" in raw.columns:
+            combined = raw["foreign_net"] + raw["trust_net"]
+            std20 = combined.rolling(20, min_periods=1).std()
+            f["chip_concentration"] = combined / (std20 + 1e-9)
+
+        f["symbol"] = symbol
+        return f
+```
+
+**修復記錄**：第 3 輪加入 FinMind API 別名寬鬆匹配；欄位對齊；容錯處理。
+
+---
+
+## 5.3 `app/factors/us_options.py`
+
+**職責**：美股期權因子引擎。
+
+```python
+import math
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from app.data.warehouse import MarketWarehouse
+
+
+class USOptionsFactorEngine:
+    def __init__(self):
+        self.warehouse = MarketWarehouse()
+
+    def fetch_chain(self, symbol: str, max_expiries: int = 4) -> pd.DataFrame:
+        try:
+            ticker = yf.Ticker(symbol)
+            expirations = ticker.options
+        except Exception as e:
+            print(f"yfinance options error for {symbol}: {e}")
+            return pd.DataFrame()
+
+        if not expirations:
+            return pd.DataFrame()
+
+        rows = []
+        today = pd.Timestamp.today().date()
+
+        for exp in expirations[:max_expiries]:
+            try:
+                chain = ticker.option_chain(exp)
+            except Exception:
+                continue
+
+            for opt_type, df in [("CALL", chain.calls), ("PUT", chain.puts)]:
+                if df is None or df.empty:
+                    continue
+                d = df[["strike", "volume", "openInterest",
+                        "impliedVolatility", "bid", "ask", "lastPrice"]].copy()
+                d["option_type"] = opt_type
+                d["expiry"] = pd.Timestamp(exp).date()
+                d["date"] = today
+                d["symbol"] = symbol
+                rows.append(d)
+
+        if not rows:
+            return pd.DataFrame()
+
+        result = pd.concat(rows, ignore_index=True)
+        result = result.rename(columns={
+            "openInterest": "open_interest",
+            "impliedVolatility": "implied_volatility",
+            "lastPrice": "last_price",
+        })
+
+        try:
+            self.warehouse.upsert_us_options(result)
+        except Exception as e:
+            print(f"Warehouse upsert failed: {e}")
+
+        return result
+
+    def compute_factors(self, symbol: str, spot: float | None = None) -> dict:
+        chain = self.fetch_chain(symbol)
+        if chain is None or chain.empty:
+            return {}
+
+        if spot is None:
+            try:
+                spot = float(yf.Ticker(symbol).history(period="1d")["Close"].iloc[-1])
+            except Exception:
+                return {}
+
+        calls = chain[chain["option_type"] == "CALL"]
+        puts = chain[chain["option_type"] == "PUT"]
+
+        factors = {}
+
+        call_vol = calls["volume"].sum()
+        put_vol = puts["volume"].sum()
+        factors["put_call_volume_ratio"] = (
+            float(put_vol / call_vol) if call_vol > 0 else np.nan
+        )
+
+        call_oi = calls["open_interest"].sum()
+        put_oi = puts["open_interest"].sum()
+        factors["put_call_oi_ratio"] = (
+            float(put_oi / call_oi) if call_oi > 0 else np.nan
+        )
+
+        atm_calls = calls.iloc[(calls["strike"] - spot).abs().argsort()[:5]]
+        atm_puts = puts.iloc[(puts["strike"] - spot).abs().argsort()[:5]]
+        atm_iv_series = pd.concat([atm_calls, atm_puts])["implied_volatility"]
+        factors["atm_iv"] = (
+            float(atm_iv_series.mean()) if not atm_iv_series.empty else np.nan
+        )
+
+        otm_puts = puts[puts["strike"] < spot * 0.95]
+        otm_calls = calls[calls["strike"] > spot * 1.05]
+        put_iv = otm_puts["implied_volatility"].mean() if not otm_puts.empty else np.nan
+        call_iv = otm_calls["implied_volatility"].mean() if not otm_calls.empty else np.nan
+        factors["iv_skew"] = (
+            float(put_iv - call_iv)
+            if pd.notna(put_iv) and pd.notna(call_iv) else np.nan
+        )
+
+        factors["max_pain"] = self._calc_max_pain_vectorized(chain, spot)
+        factors["gamma_exposure"] = self._calc_gamma_exposure(chain, spot)
+
+        total_oi = chain["open_interest"].sum()
+        factors["oi_concentration"] = (
+            float(chain.nlargest(5, "open_interest")["open_interest"].sum() / total_oi)
+            if total_oi > 0 else np.nan
+        )
+
+        return factors
+
+    def _calc_max_pain_vectorized(self, chain, spot) -> float:
+        strikes = chain["strike"].dropna().unique()
+        strikes = np.sort(strikes)
+        strikes = strikes[(strikes >= 0.7 * spot) & (strikes <= 1.3 * spot)]
+        if len(strikes) == 0:
+            return np.nan
+
+        calls = chain[chain["option_type"] == "CALL"][["strike", "open_interest"]].dropna()
+        puts = chain[chain["option_type"] == "PUT"][["strike", "open_interest"]].dropna()
+
+        call_strikes = calls["strike"].values
+        call_oi = calls["open_interest"].values
+        put_strikes = puts["strike"].values
+        put_oi = puts["open_interest"].values
+
+        call_matrix = np.maximum(strikes[:, None] - call_strikes[None, :], 0) * call_oi[None, :]
+        put_matrix = np.maximum(put_strikes[None, :] - strikes[:, None], 0) * put_oi[None, :]
+        total_pain = call_matrix.sum(axis=1) + put_matrix.sum(axis=1)
+        return float(strikes[int(np.argmin(total_pain))])
+
+    def _calc_gamma_exposure(self, chain, spot, r=0.05) -> float:
+        if chain.empty or spot <= 0:
+            return 0.0
+
+        def norm_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        total = 0.0
+        valid = chain[(chain["strike"] > spot * 0.8) & (chain["strike"] < spot * 1.2)]
+
+        for _, row in valid.iterrows():
+            k = float(row["strike"])
+            iv = float(row["implied_volatility"]) if pd.notna(row["implied_volatility"]) else 0.0
+            oi = float(row["open_interest"]) if pd.notna(row["open_interest"]) else 0.0
+            if iv <= 0 or oi <= 0 or k <= 0:
+                continue
+            t = 0.25
+            try:
+                d1 = (math.log(spot / k) + (r + 0.5 * iv ** 2) * t) / (iv * math.sqrt(t))
+                gamma = norm_pdf(d1) / (spot * iv * math.sqrt(t))
+                total += gamma * oi * 100 * spot ** 2
+            except Exception:
+                continue
+
+        return float(total)
+```
+
+**修復記錄**：第 3 輪 Max Pain 向量化；伽馬曝險容錯。
+
+---
+
+## 5.4 `app/factors/qweave_loader.py`
+
+**職責**：qweave 內置因子庫（Alpha101/158/191 子集）。
+
+```python
+class QweaveFactorLoader:
+    ALPHA101_SUBSET = {
+        "alpha001": "ts_argmax(signedpower(returns, 2), 5) - 0.5",
+        "alpha002": "-1 * correlation(rank(delta(log(volume), 2)), rank(delta(close, 1)), 6)",
+        "alpha003": "-1 * correlation(rank(open), rank(volume), 10)",
+        "alpha004": "-1 * ts_rank(rank(low), 9)",
+        "alpha006": "-1 * correlation(open, volume, 10)",
+        "alpha012": "sign(delta(volume, 1)) * (-1 * delta(close, 1))",
+        "alpha014": "(-1 * rank(delta(returns, 3))) * correlation(open, volume, 10)",
+        "alpha020": "(-1 * rank(delta(delay(close, 1), 1))) * rank(open) * rank(volume)",
+    }
+
+    ALPHA158_SUBSET = {
+        "ROC5": "close / delay(close, 5) - 1",
+        "ROC10": "close / delay(close, 10) - 1",
+        "ROC20": "close / delay(close, 20) - 1",
+        "MA5": "mean(close, 5) / close - 1",
+        "MA10": "mean(close, 10) / close - 1",
+        "STD5": "std(close, 5) / close",
+        "STD20": "std(close, 20) / close",
+        "BETA5": "slope(close, 5) / close",
+        "RSQR5": "rsquare(close, 5)",
+        "RESI5": "residual(close, 5)",
+        "MAX5": "max(high, 5) / close - 1",
+        "MIN5": "min(low, 5) / close - 1",
+        "QTLU5": "quantile(close, 5, 0.8) / close - 1",
+        "QTLD5": "quantile(close, 5, 0.2) / close - 1",
+        "TSRANK5": "ts_rank(close, 5)",
+    }
+
+    ALPHA191_SUBSET = {
+        "gtja001": "-1 * correlation(rank(delta(log(volume), 1)), rank(delta(close, 1)), 6)",
+        "gtja002": "-1 * delta(close, 1)",
+        "gtja004": "-1 * ts_rank(rank(low), 9)",
+    }
+
+    @classmethod
+    def get_all_expressions(cls):
+        all_factors = {}
+        all_factors.update(cls.ALPHA101_SUBSET)
+        all_factors.update(cls.ALPHA158_SUBSET)
+        all_factors.update(cls.ALPHA191_SUBSET)
+        return all_factors
+
+    @classmethod
+    def get_by_category(cls, category):
+        if category == "alpha101":
+            return cls.ALPHA101_SUBSET
+        if category == "alpha158":
+            return cls.ALPHA158_SUBSET
+        if category == "alpha191":
+            return cls.ALPHA191_SUBSET
+        return {}
+
+    @classmethod
+    def batch_evaluate(cls, bars, categories=None):
+        from app.backtest.signal_dsl import SignalDSL
+        if categories is None:
+            categories = ["alpha101", "alpha158", "alpha191"]
+
+        dsl = SignalDSL(bars)
+        results = {}
+
+        for cat in categories:
+            factors = cls.get_by_category(cat)
+            for name, expr in factors.items():
+                try:
+                    score = dsl.evaluate(expr)
+                    if score.abs().sum() > 1e-9:
+                        val = score.iloc[-1]
+                        if not (isinstance(val, float) and val != val):
+                            results[name] = float(val)
+                except Exception as e:
+                    print(f"qweave factor {name} failed: {e}")
+        return results
+
+    @classmethod
+    def batch_evaluate_series(cls, bars, categories=None):
+        from app.backtest.signal_dsl import SignalDSL
+        if categories is None:
+            categories = ["alpha101", "alpha158", "alpha191"]
+
+        dsl = SignalDSL(bars)
+        results = {}
+
+        for cat in categories:
+            factors = cls.get_by_category(cat)
+            for name, expr in factors.items():
+                try:
+                    score = dsl.evaluate(expr)
+                    if score.abs().sum() > 1e-9:
+                        results[name] = score
+                except Exception as e:
+                    print(f"qweave factor {name} failed: {e}")
+        return results
+```
+
+**修復記錄**：第 3 輪對齊擴展後的 DSL。
+
+---
+
+## 5.5 `app/factors/orthogonalize.py`
+
+**職責**：因子正交化（對稱 / 施密特 / PCA）。
+
+```python
+import numpy as np
+import pandas as pd
+
+
+class FactorOrthogonalizer:
+    @staticmethod
+    def symmetric(factors: pd.DataFrame) -> pd.DataFrame:
+        X = factors.dropna()
+        if X.empty or len(X) < 3:
+            return factors
+
+        X_std = (X - X.mean()) / (X.std() + 1e-9)
+        cov = np.cov(X_std.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+        idx = eigenvalues.argsort()[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.abs(eigenvalues) + 1e-9))
+        S = eigenvectors @ D_inv_sqrt @ eigenvectors.T
+
+        result = X_std.values @ S
+        return pd.DataFrame(result, index=X_std.index, columns=factors.columns)
+
+    @staticmethod
+    def gram_schmidt(factors: pd.DataFrame, base_col: str | None = None) -> pd.DataFrame:
+        X = factors.dropna()
+        if X.empty:
+            return factors
+
+        cols = list(X.columns)
+        if base_col and base_col in cols:
+            cols.remove(base_col)
+            cols = [base_col] + cols
+
+        X_std = (X[cols] - X[cols].mean()) / (X[cols].std() + 1e-9)
+        result = pd.DataFrame(index=X_std.index, columns=cols, dtype=float)
+
+        for i, col in enumerate(cols):
+            v = X_std[col].values.copy()
+            for j in range(i):
+                prev = result[cols[j]].values
+                proj = (v @ prev) / (prev @ prev + 1e-9)
+                v = v - proj * prev
+            result[col] = v
+        return result
+
+    @staticmethod
+    def pca(factors: pd.DataFrame, n_components: int | None = None) -> pd.DataFrame:
+        X = factors.dropna()
+        if X.empty:
+            return factors
+
+        X_std = (X - X.mean()) / (X.std() + 1e-9)
+        cov = np.cov(X_std.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        idx = eigenvalues.argsort()[::-1]
+        eigenvectors = eigenvectors[:, idx]
+
+        if n_components is None:
+            n_components = len(factors.columns)
+        n_components = min(n_components, len(eigenvectors.T))
+        components = eigenvectors[:, :n_components]
+        result = X_std.values @ components
+
+        cols = [f"PC{i + 1}" for i in range(n_components)]
+        return pd.DataFrame(result, index=X_std.index, columns=cols)
+```
+
+**修復記錄**：第 2 輪賦值邏輯改為直接回傳。
+
+---
+
+## 5.6 `app/factors/inspect.py`
+
+**職責**：因子診斷（IC / 分層 / 衰減）。
+
+```python
+import pandas as pd
+import numpy as np
+
+
+class FactorInspector:
+    def __init__(self, bars: pd.DataFrame, factors: pd.DataFrame, factor_cols: list[str]):
+        self.bars = bars.copy().sort_values("timestamp").reset_index(drop=True)
+        self.factors = factors.copy()
+        self.factor_cols = factor_cols
+        self.fwd_ret = self.bars["close"].pct_change().shift(-1)
+
+    def compute_ic(self, period: int = 1) -> pd.DataFrame:
+        results = []
+        fwd = self.bars["close"].pct_change(period).shift(-period)
+
+        for col in self.factor_cols:
+            if col not in self.factors.columns:
+                continue
+            f = self.factors[col].reindex(self.bars.index)
+            valid = f.notna() & fwd.notna()
+            if valid.sum() < 20:
+                continue
+            ic = f[valid].corr(fwd[valid])
+            rank_ic = f[valid].rank().corr(fwd[valid].rank())
+            results.append({
+                "factor": col, "IC": round(ic, 6),
+                "Rank_IC": round(rank_ic, 6),
+                "ICIR": round(ic / (f.std() + 1e-9), 4), "period": period,
+            })
+        return pd.DataFrame(results)
+
+    def layer_returns(self, factor_col: str, n_layers: int = 5) -> pd.DataFrame:
+        f = self.factors[factor_col].reindex(self.bars.index)
+        try:
+            layers = pd.qcut(f, n_layers, labels=False, duplicates="drop")
+        except Exception:
+            return pd.DataFrame()
+
+        results = []
+        for layer in range(n_layers):
+            mask = layers == layer
+            ret = self.fwd_ret[mask].mean()
+            results.append({"layer": layer + 1,
+                            "mean_return": round(ret, 6),
+                            "count": int(mask.sum())})
+        return pd.DataFrame(results)
+
+    def factor_decay(self, factor_col: str, max_period: int = 20) -> pd.DataFrame:
+        f = self.factors[factor_col].reindex(self.bars.index)
+        results = []
+        for p in range(1, max_period + 1):
+            fwd = self.bars["close"].pct_change(p).shift(-p)
+            valid = f.notna() & fwd.notna()
+            if valid.sum() < 20:
+                continue
+            ic = f[valid].corr(fwd[valid])
+            results.append({"period": p, "IC": round(ic, 6)})
+        return pd.DataFrame(results)
+
+    def full_report(self, factor_col: str) -> dict:
+        return {
+            "ic": self.compute_ic(1).to_dict("records"),
+            "ic_5d": self.compute_ic(5).to_dict("records"),
+            "ic_20d": self.compute_ic(20).to_dict("records"),
+            "layers": self.layer_returns(factor_col).to_dict("records"),
+            "decay": self.factor_decay(factor_col).to_dict("records"),
+        }
+```
+
+---
+
+# 本批次完成
+
+**已交付 22 個模組**：
+- Part 1 核心層：6 個
+- Part 2 數據層：5 個
+- Part 3 回測層：5 個
+- Part 4 風控層：2 個
+- Part 5 因子層：6 個（含 `__init__`）
+
+**下一批次（批次 3）**：Agent 層、組合層、執行層、審計層、監控層、研究層、記憶層、API 層、歸檔說明。
+</script>
+</section>
+```
+
+---
+
+## 使用方式
+
+1. 打開你的 `invest-os.html`
+2. 找到 `<section id="batch2">...</section>`（目前是 placeholder）
+3. **整段替換**為上面這段 HTML
+4. 存檔 → 重新整理瀏覽器
+5. 側邊欄點「🔧 模組 Part 1-5」就能看到完整內容
+
+批次 3 待命。要繼續就說「批次 3」。
